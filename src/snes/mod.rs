@@ -101,7 +101,8 @@ impl SFC {
             return Err(Error::NoCartridge);
         }
         let mut h = Header::parse(&block);
-        if h.homebrew {
+        // A table hit returns before the Homebrew probe (0x4735f0).
+        if carts::lookup(h.block_crc).is_none() && h.homebrew {
             self.homebrew_probe(&block, &mut h)?;
         }
         Ok(h)

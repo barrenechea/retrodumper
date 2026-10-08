@@ -184,30 +184,51 @@ fn cmd_snes_info(args: &[String]) -> Result<(), Error> {
     let dev = open_device()?;
     let mut sfc = SFC::new(Box::new(dev));
     let h = sfc.info()?;
-    let m = snes::detect_mapper(&h);
-    println!("title:     {:?}", h.title);
-    println!("mapper:    {} ({})", m.number(), m.name());
+    if let Some(s) = snes::carts::identify(&h) {
+        println!("title:     {}", s.title);
+        if !s.alt.is_empty() {
+            println!("alt:       {}", s.alt);
+        }
+        println!("mapper:    {} ({})", s.mapper.number(), s.mapper.name());
+        println!(
+            "rom size:  {} bytes ({} Mbit)",
+            s.rom_size,
+            s.rom_size >> 17
+        );
+        println!("sram size: {} bytes ({} Kbit)", s.ram_size, s.ram_size >> 7);
+        for name in snes::carts::enhancements(s.flags) {
+            println!("enhancement: {name}");
+        }
+        if s.from_database && s.title != h.title {
+            println!("header:    {}", h.title);
+        }
+    } else {
+        let hint = snes::detect_mapper(&h);
+        println!("Can not detect cartridge detail information.");
+        println!("Error code: 0x{:08X}", h.block_crc);
+        println!("header:    {}", h.title);
+        println!("hint:      {} ({})", hint.number(), hint.name());
+        println!(
+            "hint rom:  {} bytes (code 0x{:02X})",
+            h.rom_size(),
+            h.size_code
+        );
+        println!(
+            "hint sram: {} bytes (code 0x{:02X})",
+            h.sram_size(),
+            h.sram_code
+        );
+        if h.is_sfx() {
+            println!("note:      Super FX");
+        }
+        if h.is_sa1() {
+            println!("note:      SA-1");
+        }
+    }
     println!("map mode:  0x{:02X}", h.map_mode);
     println!("chip:      0x{:02X}", h.chip);
-    println!(
-        "rom size:  {} bytes ({} Mbit, code 0x{:02X})",
-        h.rom_size(),
-        h.rom_size() >> 17,
-        h.size_code
-    );
-    println!(
-        "sram size: {} bytes (code 0x{:02X})",
-        h.sram_size(),
-        h.sram_code
-    );
     if h.exp_ram_size() > 0 {
         println!("exp ram:   {} bytes", h.exp_ram_size());
-    }
-    if h.is_sfx() {
-        println!("note:      Super FX");
-    }
-    if h.is_sa1() {
-        println!("note:      SA-1");
     }
     println!("region:    0x{:02X}", h.region);
     println!("version:   1.{}", h.version);
@@ -234,29 +255,17 @@ fn cmd_snes_dump(args: &[String]) -> Result<(), Error> {
     let dev = open_device()?;
     let mut sfc = SFC::new(Box::new(dev));
     let h = sfc.info()?;
-    let mut m = snes::detect_mapper(&h);
-    if mmc != 0 {
-        m = snes::Mapper::from_u32(mmc as u32)
-            .ok_or_else(|| Error::Cli(format!("invalid mapper {mmc} (must be 1-8)")))?;
-    }
-    if mmc == 0 && !h.homebrew && !h.valid() {
-        eprintln!(
-            "warning: header at $FFC0 is not self-consistent; mapper {} is a guess (use --mmc)",
-            m.name()
-        );
-    }
-    let mut rom_size = h.rom_size();
-    if size != 0 {
-        rom_size = usize::try_from(size).unwrap_or(0);
-    }
-    if rom_size == 0 {
-        return Err(Error::Cli("unknown ROM size; use --size".into()));
-    }
-    eprintln!("dumping {:?} ({}), {} bytes", h.title, m.name(), rom_size);
+    let choice = snes::carts::choose_dump(&h, mmc, size)?;
+    eprintln!(
+        "dumping {} ({}), {} bytes",
+        choice.title,
+        choice.mapper.name(),
+        choice.size
+    );
 
-    let mut rom = Vec::with_capacity(rom_size);
+    let mut rom = Vec::with_capacity(choice.size);
     {
-        let mut dumper = snes::Dumper::new(&mut sfc, m, rom_size);
+        let mut dumper = snes::Dumper::new(&mut sfc, choice.mapper, choice.size);
         let last = &mut -1i64;
         dumper.dump(&mut rom, |done, total| {
             let pct = done as i64 * 100 / total as i64;
@@ -294,7 +303,7 @@ fn cmd_snes_dump(args: &[String]) -> Result<(), Error> {
                 "checksum FAILED: got 0x{:04X}, header wants 0x{:04X}",
                 got, h.checksum
             );
-            for ts in snes::trimmed_sizes(rom_size) {
+            for ts in snes::trimmed_sizes(choice.size) {
                 if snes::verify_checksum(&rom[..ts], h.checksum).0 {
                     eprintln!("note: checksum passes at trimmed size {ts} bytes");
                     break;
@@ -304,7 +313,7 @@ fn cmd_snes_dump(args: &[String]) -> Result<(), Error> {
     }
 
     let path = if out.is_empty() {
-        sanitize_title(&h.title) + ".sfc"
+        sanitize_title(&choice.title) + ".sfc"
     } else {
         out
     };
@@ -329,21 +338,10 @@ fn cmd_snes_read_save(args: &[String]) -> Result<(), Error> {
     let dev = open_device()?;
     let mut sfc = SFC::new(Box::new(dev));
     let h = sfc.info()?;
-    let mut m = snes::detect_mapper(&h);
-    if mmc != 0 {
-        m = snes::Mapper::from_u32(mmc as u32)
-            .ok_or_else(|| Error::Cli(format!("invalid mapper {mmc} (must be 1-8)")))?;
-    }
-    let mut sram_size = h.sram_size();
-    if size != 0 {
-        sram_size = usize::try_from(size).unwrap_or(0);
-    }
-    if sram_size == 0 {
-        return Err(Error::Cli("no SRAM size known; use --size".into()));
-    }
-    let data = sfc.read_save(m, sram_size)?;
+    let choice = snes::carts::choose_read_save(&h, mmc, size)?;
+    let data = sfc.read_save(choice.mapper, choice.size)?;
     let path = if out.is_empty() {
-        sanitize_title(&h.title) + ".srm"
+        sanitize_title(&choice.title) + ".srm"
     } else {
         out
     };
@@ -362,19 +360,15 @@ fn cmd_snes_write_save(args: &[String]) -> Result<(), Error> {
     let dev = open_device()?;
     let mut sfc = SFC::new(Box::new(dev));
     let h = sfc.info()?;
-    let mut m = snes::detect_mapper(&h);
-    if mmc != 0 {
-        m = snes::Mapper::from_u32(mmc as u32)
-            .ok_or_else(|| Error::Cli(format!("invalid mapper {mmc} (must be 1-8)")))?;
-    }
-    if h.sram_size() > 0 && data.len() > h.sram_size() {
+    let mapper = snes::carts::choose_mapper(&h, mmc)?;
+    let cap = snes::carts::ram_cap(&h);
+    if cap > 0 && data.len() > cap {
         return Err(Error::Cli(format!(
-            "save is {} bytes but SRAM size is {}",
-            data.len(),
-            h.sram_size()
+            "save is {} bytes but SRAM size is {cap}",
+            data.len()
         )));
     }
-    sfc.write_save(m, &data, !no_verify)?;
+    sfc.write_save(mapper, &data, !no_verify)?;
     let note = if no_verify {
         ""
     } else {

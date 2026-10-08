@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::LazyLock;
-
 use super::header::Header;
 
 /// An SFC ROM mapper (MMC) type, numbered as in the official client's MMC
@@ -93,38 +90,19 @@ impl Mapper {
     }
 }
 
-/// Maps the CRC32 of the $E000 header block (`Header::block_crc`, the
-/// official client's database key) to a mapper, for carts whose header does
-/// not identify the mapper by itself. It mirrors the MMC column of the
-/// client's database (FUN_00472560) for the carts verified so far.
-fn known_carts() -> &'static HashMap<u32, Mapper> {
-    static MAP: LazyLock<HashMap<u32, Mapper>> = LazyLock::new(|| {
-        let mut m = HashMap::new();
-        m.insert(0x350B_B992, Mapper::Derby96); // Derby Stallion 96 (client special case)
-        m.insert(0xA248_E81A, Mapper::HiRom); // Donkey Kong Country (USA) V1.2 (Rev B), 32 Mbit
-        m
-    });
-    &MAP
-}
-
-/// Pick a mapper from the header:
+/// Mapper suggested by the header. A cart-table hit and `--mmc` both win
+/// over this.
 ///
 /// - Homebrew Flashcard V1 simple reports the "MENU"/0xF8BB0744 signature
-/// - carts in `known_carts` use the database's mapper
 /// - SPC7110 reports map mode 0x3A (cartridge type 0xF5/0xF9)
 /// - SDD-1 reports cartridge type 0x43/0x45
 /// - CX4 reports cartridge type 0xF3
 /// - ExHiROM reports map mode 0x25/0x35
 /// - HiROM reports map mode 0x21/0x31
 /// - everything else, including SA-1 and Super FX carts, is LoROM
-///
-/// The `--mmc` override in the CLI takes precedence over all of this.
 pub fn detect_mapper(h: &Header) -> Mapper {
     if h.homebrew {
         return Mapper::Homebrew;
-    }
-    if let Some(&m) = known_carts().get(&h.block_crc) {
-        return m;
     }
     if h.map_mode == 0x3A {
         return Mapper::SPC7110;

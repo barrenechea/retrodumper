@@ -12,12 +12,24 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use super::header::Header;
 use super::mapper::Mapper;
+use crate::{Error, Result};
 
+/// Battery-backed SRAM.
+pub const FLAG_BATTERY: u32 = 0x1;
 /// CX4. Also forces mapper 7.
 pub const FLAG_CX4: u32 = 0x4;
+/// DSP enhancement.
+pub const FLAG_DSP: u32 = 0x8;
+/// Real-time clock.
+pub const FLAG_RTC: u32 = 0x100;
+/// SA-1. The row's mapper id stays LoROM.
+pub const FLAG_SA1: u32 = 0x200;
 /// SDD-1. Also forces mapper 6.
 pub const FLAG_SDD1: u32 = 0x400;
+/// Super FX. The row's mapper id stays LoROM.
+pub const FLAG_SUPER_FX: u32 = 0x800;
 /// SPC7110. Also forces mapper 5.
 pub const FLAG_SPC7110: u32 = 0x4000;
 
@@ -46,6 +58,178 @@ struct Table {
 fn table() -> &'static Table {
     static TABLE: LazyLock<Table> = LazyLock::new(|| parse(include_str!("carts.json")));
     &TABLE
+}
+
+/// Names the client prints for enhancement bits, client lines first.
+pub fn enhancements(flags: u32) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if flags & FLAG_SDD1 != 0 {
+        names.push("SDD-1");
+    }
+    if flags & FLAG_SPC7110 != 0 {
+        names.push("SPC7110");
+    }
+    if flags & FLAG_CX4 != 0 {
+        names.push("C4");
+    }
+    if flags & FLAG_BATTERY != 0 {
+        names.push("battery");
+    }
+    if flags & FLAG_DSP != 0 {
+        names.push("DSP");
+    }
+    if flags & FLAG_RTC != 0 {
+        names.push("RTC");
+    }
+    if flags & FLAG_SA1 != 0 {
+        names.push("SA-1");
+    }
+    if flags & FLAG_SUPER_FX != 0 {
+        names.push("Super FX");
+    }
+    names
+}
+
+#[derive(Debug)]
+pub struct Selection {
+    pub title: String,
+    pub alt: String,
+    pub mapper: Mapper,
+    pub rom_size: usize,
+    pub ram_size: usize,
+    pub flags: u32,
+    /// False for the Homebrew signature path, which is not a table row.
+    pub from_database: bool,
+}
+
+/// Table row for this block CRC, or the Homebrew signature when the CRC misses.
+pub fn identify(h: &Header) -> Option<Selection> {
+    if let Some(c) = lookup(h.block_crc) {
+        return Some(Selection {
+            title: c.title.clone(),
+            alt: c.alt.clone(),
+            mapper: c.mapper,
+            rom_size: c.rom_size,
+            ram_size: c.ram_size,
+            flags: c.flags,
+            from_database: true,
+        });
+    }
+    if h.homebrew {
+        return Some(Selection {
+            title: h.title.clone(),
+            alt: String::new(),
+            mapper: Mapper::Homebrew,
+            rom_size: h.rom_size(),
+            ram_size: h.sram_size(),
+            flags: 0,
+            from_database: false,
+        });
+    }
+    None
+}
+
+/// Dump mapper and ROM size. A table miss needs both `--mmc` and `--size`.
+pub fn choose_dump(h: &Header, mmc: i64, size: i64) -> Result<IoChoice> {
+    choose(
+        h,
+        mmc,
+        size,
+        |s| s.rom_size,
+        "--mmc and --size",
+        "unknown ROM size; use --size",
+    )
+}
+
+/// Save mapper and RAM size. A table miss needs both `--mmc` and `--size`.
+pub fn choose_read_save(h: &Header, mmc: i64, size: i64) -> Result<IoChoice> {
+    choose(
+        h,
+        mmc,
+        size,
+        |s| s.ram_size,
+        "--mmc and --size",
+        "no SRAM size known; use --size",
+    )
+}
+
+/// Mapper for a save write. A table miss needs `--mmc`. The file supplies the length.
+pub fn choose_mapper(h: &Header, mmc: i64) -> Result<Mapper> {
+    if let Some(mapper) = mapper_override(mmc)? {
+        return Ok(mapper);
+    }
+    identify(h)
+        .map(|s| s.mapper)
+        .ok_or_else(|| undetected(h.block_crc, "--mmc"))
+}
+
+/// RAM size from a table hit. Zero means the write is not capped.
+pub fn ram_cap(h: &Header) -> usize {
+    identify(h).map(|s| s.ram_size).unwrap_or(0)
+}
+
+#[derive(Debug)]
+pub struct IoChoice {
+    pub title: String,
+    pub mapper: Mapper,
+    pub size: usize,
+}
+
+fn choose(
+    h: &Header,
+    mmc: i64,
+    size: i64,
+    from_row: impl Fn(&Selection) -> usize,
+    miss: &str,
+    zero: &str,
+) -> Result<IoChoice> {
+    let mapper = mapper_override(mmc)?;
+    let manual = size_override(size)?;
+    if let Some(sel) = identify(h) {
+        let n = manual.unwrap_or_else(|| from_row(&sel));
+        if n == 0 {
+            return Err(Error::Cli(zero.into()));
+        }
+        return Ok(IoChoice {
+            title: sel.title,
+            mapper: mapper.unwrap_or(sel.mapper),
+            size: n,
+        });
+    }
+    match (mapper, manual) {
+        (Some(mapper), Some(n)) => Ok(IoChoice {
+            title: h.title.clone(),
+            mapper,
+            size: n,
+        }),
+        _ => Err(undetected(h.block_crc, miss)),
+    }
+}
+
+fn mapper_override(mmc: i64) -> Result<Option<Mapper>> {
+    if mmc == 0 {
+        return Ok(None);
+    }
+    let n = u32::try_from(mmc)
+        .map_err(|_| Error::Cli(format!("invalid mapper {mmc} (must be 1-8)")))?;
+    Mapper::from_u32(n)
+        .map(Some)
+        .ok_or_else(|| Error::Cli(format!("invalid mapper {mmc} (must be 1-8)")))
+}
+
+fn size_override(size: i64) -> Result<Option<usize>> {
+    if size == 0 {
+        return Ok(None);
+    }
+    usize::try_from(size)
+        .map(Some)
+        .map_err(|_| Error::Cli(format!("invalid --size {size}")))
+}
+
+fn undetected(crc: u32, need: &str) -> Error {
+    Error::Cli(format!(
+        "Can not detect cartridge detail information. Error code: 0x{crc:08X}. Pass {need}."
+    ))
 }
 
 /// First row for this block CRC, after mapper overrides.
@@ -260,6 +444,7 @@ fn hex_val(b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snes::header::Header;
 
     #[test]
     fn table_covers_the_client_walk() {
@@ -364,5 +549,115 @@ mod tests {
         assert_eq!(apply_overrides(0, 8, 0), Some(Mapper::Homebrew));
         assert_eq!(apply_overrides(0, 0, 0), None);
         assert_eq!(apply_overrides(0, 9, 0), None);
+    }
+
+    #[test]
+    fn enhancements_follow_the_client_lines() {
+        assert_eq!(enhancements(0x4), ["C4"]);
+        assert_eq!(enhancements(0x401), ["SDD-1", "battery"]);
+        assert_eq!(enhancements(0x4001), ["SPC7110", "battery"]);
+        assert_eq!(enhancements(FLAG_SA1 | FLAG_SUPER_FX), ["SA-1", "Super FX"]);
+    }
+
+    #[test]
+    fn a_table_hit_wins_over_the_homebrew_signature() {
+        let h = Header {
+            block_crc: DERBY_STALLION_96,
+            homebrew: true,
+            ..Default::default()
+        };
+        let s = identify(&h).unwrap();
+        assert!(s.from_database);
+        assert_eq!(s.title, "Derby Stallion 96 (Japan)");
+        assert_eq!(s.alt, "ダービースタリオン96");
+        assert_eq!(s.mapper, Mapper::Derby96);
+        assert_eq!(s.rom_size, 0x30_0000);
+        assert_eq!(s.ram_size, 0x8000);
+    }
+
+    #[test]
+    fn a_signature_miss_uses_the_homebrew_sizes() {
+        let h = Header {
+            homebrew: true,
+            title: "GAME".into(),
+            rom_override: 0x60_0000,
+            sram_override: 0x8000,
+            ..Default::default()
+        };
+        let s = identify(&h).unwrap();
+        assert!(!s.from_database);
+        assert_eq!(s.title, "GAME");
+        assert_eq!(s.mapper, Mapper::Homebrew);
+        assert_eq!(s.rom_size, 0x60_0000);
+        assert_eq!(s.ram_size, 0x8000);
+    }
+
+    #[test]
+    fn an_unknown_cart_is_not_dumped_from_the_header() {
+        let h = Header {
+            block_crc: 1,
+            map_mode: 0x21,
+            title: "HEADER".into(),
+            ..Default::default()
+        };
+        assert!(identify(&h).is_none());
+        let err = choose_dump(&h, 0, 0).unwrap_err().to_string();
+        assert!(err.contains("Can not detect cartridge detail information"));
+        assert!(err.contains("Error code: 0x00000001"));
+        assert!(err.contains("Pass --mmc and --size"));
+        assert!(choose_dump(&h, 2, 0).is_err());
+        assert!(choose_dump(&h, 0, 4096).is_err());
+        let c = choose_dump(&h, 2, 4096).unwrap();
+        assert_eq!(c.mapper, Mapper::HiRom);
+        assert_eq!(c.size, 4096);
+        assert_eq!(c.title, "HEADER");
+    }
+
+    #[test]
+    fn a_known_cart_uses_the_row_unless_flags_override_it() {
+        let h = Header {
+            block_crc: DERBY_STALLION_96,
+            ..Default::default()
+        };
+        let c = choose_dump(&h, 0, 0).unwrap();
+        assert_eq!(c.mapper, Mapper::Derby96);
+        assert_eq!(c.size, 0x30_0000);
+        let forced = choose_dump(&h, 1, 0).unwrap();
+        assert_eq!(forced.mapper, Mapper::LoRom);
+        assert_eq!(forced.size, 0x30_0000);
+        let sized = choose_dump(&h, 0, 0x8000).unwrap();
+        assert_eq!(sized.mapper, Mapper::Derby96);
+        assert_eq!(sized.size, 0x8000);
+    }
+
+    #[test]
+    fn save_read_uses_ram_size_and_a_miss_needs_both_flags() {
+        let derby = Header {
+            block_crc: DERBY_STALLION_96,
+            ..Default::default()
+        };
+        let c = choose_read_save(&derby, 0, 0).unwrap();
+        assert_eq!(c.size, 0x8000);
+        assert_eq!(c.mapper, Mapper::Derby96);
+        assert_eq!(ram_cap(&derby), 0x8000);
+        assert_eq!(choose_mapper(&derby, 0).unwrap(), Mapper::Derby96);
+
+        let tengu = Header {
+            block_crc: 0x0997_0FD0,
+            ..Default::default()
+        };
+        assert!(choose_read_save(&tengu, 0, 0).is_err());
+        let manual = choose_read_save(&tengu, 0, 0x100).unwrap();
+        assert_eq!(manual.mapper, Mapper::Homebrew);
+        assert_eq!(manual.size, 0x100);
+
+        let unknown = Header {
+            block_crc: 1,
+            ..Default::default()
+        };
+        assert!(choose_read_save(&unknown, 0, 0).is_err());
+        assert!(choose_mapper(&unknown, 0).is_err());
+        assert_eq!(choose_mapper(&unknown, 3).unwrap(), Mapper::ExHiRom);
+        assert_eq!(ram_cap(&unknown), 0);
     }
 }
