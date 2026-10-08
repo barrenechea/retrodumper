@@ -46,6 +46,7 @@ fn usage(err: Option<Error>) -> Result<(), Error> {
   retrodump snes dump [-o FILE]     dump the ROM
   retrodump snes read-save [-o FILE]
   retrodump snes write-save FILE
+  retrodump snes flash FILE         program a flash cart
   retrodump debug peek ADDR LEN     hexdump bus addresses via DUMP.ROM
   retrodump help"
     );
@@ -163,7 +164,7 @@ fn cmd_device(_args: &[String]) -> Result<(), Error> {
 fn cmd_snes(args: &[String]) -> Result<(), Error> {
     if args.is_empty() {
         return Err(Error::Cli(
-            "snes: missing subcommand (info, dump, read-save, write-save)".into(),
+            "snes: missing subcommand (info, dump, read-save, write-save, flash)".into(),
         ));
     }
     match args[0].as_str() {
@@ -171,6 +172,7 @@ fn cmd_snes(args: &[String]) -> Result<(), Error> {
         "dump" => cmd_snes_dump(&args[1..]),
         "read-save" => cmd_snes_read_save(&args[1..]),
         "write-save" => cmd_snes_write_save(&args[1..]),
+        "flash" => cmd_snes_flash(&args[1..]),
         other => Err(Error::Cli(format!("snes: unknown subcommand {other:?}"))),
     }
 }
@@ -267,13 +269,7 @@ fn cmd_snes_dump(args: &[String]) -> Result<(), Error> {
     {
         let mut dumper = snes::Dumper::new(&mut sfc, choice.mapper, choice.size);
         let last = &mut -1i64;
-        dumper.dump(&mut rom, |done, total| {
-            let pct = done as i64 * 100 / total as i64;
-            if pct / 10 != *last / 10 {
-                *last = pct;
-                eprint!("\r  {pct:3}%");
-            }
-        })?;
+        dumper.dump(&mut rom, |done, total| percent(done, total, last))?;
     }
     eprintln!();
 
@@ -348,6 +344,98 @@ fn cmd_snes_read_save(args: &[String]) -> Result<(), Error> {
     std::fs::write(&path, &data).map_err(Error::Io)?;
     eprintln!("wrote {} ({} bytes)", path, data.len());
     Ok(())
+}
+
+fn cmd_snes_flash(args: &[String]) -> Result<(), Error> {
+    let mmc = get_int(args, "mmc")?;
+    let no_verify = has_flag(args, "no-verify");
+    let file = positionals(args)
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Cli("usage: retrodump snes flash FILE".into()))?;
+    let image = std::fs::read(&file).map_err(Error::Io)?;
+
+    let dev = open_device()?;
+    let mut sfc = SFC::new(Box::new(dev));
+    let mapper = flash_mapper(&mut sfc, mmc)?;
+    eprintln!("flashing {} bytes ({})", image.len(), mapper.name());
+    let written = {
+        let mut flash = snes::Flash::new(&mut sfc, mapper);
+        let mut last = -1i64;
+        retrodump::cart::program_image(
+            &mut flash,
+            &image,
+            |n| eprintln!("flash: {n} bytes"),
+            || eprintln!("erasing..."),
+            || std::thread::sleep(std::time::Duration::from_secs(1)),
+            |done, total| percent(done, total, &mut last),
+        )?
+    };
+    eprintln!();
+    if no_verify {
+        eprintln!("verification skipped");
+    } else {
+        let mut got = Vec::new();
+        let mut last = -1i64;
+        snes::Dumper::new(&mut sfc, mapper, written.len()).dump(&mut got, |done, total| {
+            percent(done, total, &mut last);
+        })?;
+        eprintln!();
+        if got != written {
+            return Err(Error::FlashVerifyFailed);
+        }
+        eprintln!("verified by read-back");
+    }
+    eprintln!("wrote {} bytes to flash", written.len());
+    Ok(())
+}
+
+fn flash_mapper(sfc: &mut SFC, mmc: i64) -> Result<snes::Mapper, Error> {
+    match sfc.info() {
+        Ok(h) => snes::carts::choose_mapper(&h, mmc),
+        Err(Error::NoCartridge) => match u32::try_from(mmc).ok().and_then(snes::Mapper::from_u32) {
+            Some(mapper) => Ok(mapper),
+            None if mmc == 0 => Err(Error::Cli("no cartridge header; pass --mmc".into())),
+            None => Err(Error::Cli(format!("invalid mapper {mmc} (must be 1-8)"))),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+fn percent(done: usize, total: usize, last: &mut i64) {
+    if total == 0 {
+        return;
+    }
+    let pct = done as i64 * 100 / total as i64;
+    if pct / 10 != *last / 10 {
+        *last = pct;
+        eprint!("\r  {pct:3}%");
+    }
+}
+
+fn positionals(args: &[String]) -> Vec<String> {
+    const VALUED: &[&str] = &["o", "size", "mmc"];
+    let mut out = Vec::new();
+    let mut skip_value = false;
+    for a in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if let Some(name) = a.strip_prefix('-') {
+            let name = name.trim_start_matches('-');
+            let (name, has_value) = match name.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (name, false),
+            };
+            if !has_value && VALUED.contains(&name) {
+                skip_value = true;
+            }
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out
 }
 
 fn cmd_snes_write_save(args: &[String]) -> Result<(), Error> {
@@ -451,5 +539,15 @@ mod tests {
         assert_eq!(parse_c_int("-2"), Some(-2));
         assert_eq!(parse_c_int("0x"), None);
         assert_eq!(parse_c_int("08"), None);
+    }
+
+    #[test]
+    fn positionals_skip_flag_values() {
+        let args = ["--mmc", "1", "game.sfc", "--no-verify"]
+            .map(str::to_string)
+            .to_vec();
+        assert_eq!(super::positionals(&args), vec!["game.sfc".to_string()]);
+        let args = ["game.sfc", "--mmc=2"].map(str::to_string).to_vec();
+        assert_eq!(super::positionals(&args), vec!["game.sfc".to_string()]);
     }
 }

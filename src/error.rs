@@ -41,6 +41,16 @@ pub enum Error {
         addr: usize,
         n: usize,
     },
+    /// Flash init returned no program window (`0x473b40`).
+    FlashInit,
+    /// CFI identify returned no chip size (`0x472f70`).
+    FlashIdentify,
+    /// Chip-erase status was not `0xFF` within the client's attempt budget.
+    FlashEraseTimeout,
+    /// The file is empty, or it does not fit in the flash (`0x459200`).
+    FlashFileSize,
+    /// Programmed bytes did not match the image.
+    FlashVerifyFailed,
     /// Shown as-is. `Display` does not add a prefix.
     Cli(String),
 }
@@ -109,6 +119,11 @@ impl fmt::Display for Error {
             Error::BusOutOfRange { addr, n } => {
                 write!(f, "retrodump: bus read out of range: 0x{addr:X}+{n}")
             }
+            Error::FlashInit => write!(f, "snes: Device init error."),
+            Error::FlashIdentify => write!(f, "snes: Check flash cartridge error."),
+            Error::FlashEraseTimeout => write!(f, "snes: Erase flash cartridge error."),
+            Error::FlashFileSize => write!(f, "snes: ROM file size error."),
+            Error::FlashVerifyFailed => write!(f, "snes: Check failure."),
             Error::Cli(s) => write!(f, "{s}"),
         }
     }

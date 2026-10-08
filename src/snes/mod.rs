@@ -1,6 +1,8 @@
 pub mod carts;
 pub mod dump;
+pub mod flash;
 pub mod header;
+mod homebrew;
 pub mod mapper;
 pub mod sram;
 pub mod verify;
@@ -10,6 +12,7 @@ use crate::protocol::Frame;
 use crate::{Error, Result};
 
 pub use dump::Dumper;
+pub use flash::Flash;
 pub use header::Header;
 pub use mapper::{Mapper, detect_mapper};
 pub use sram::sram_addr;
@@ -20,10 +23,14 @@ pub const GROUP_SFC: u8 = 0x0F;
 pub const OP_SFC_INIT: u8 = 0x01; // select SFC; IV[16]@0x0C, key[16]@0x1C
 pub const OP_SFC_READ_BYTE: u8 = 0x02; // bus read; addr24@3, count@6
 pub const OP_SFC_WRITE_BYTE: u8 = 0x03; // bus write; addr24@3, val@7
-pub const OP_SFC_FLASH_WRITE: u8 = 0x05; // flash program write (fallback)
+pub const OP_SFC_FLASH_WRITE: u8 = 0x05; // single-byte flash write; fallback when 0x0B sees no CFI
+pub const OP_SFC_FLASH_PROG_06: u8 = 0x06; // bulk flash program; 0x1F2 bytes, addr32@4, len16@8, data@0x0C
+pub const OP_SFC_FLASH_PROG_07: u8 = 0x07; // bulk flash program; 0x1E0 bytes, same layout as 0x06
 pub const OP_SFC_SRAM_READ: u8 = 0x09; // SRAM read; addr24@4, len16@8 (<=0x800)
 pub const OP_SFC_SRAM_WRITE: u8 = 0x0A; // SRAM write; addr24@4, len16@8 (<=0x1F2)
-pub const OP_SFC_FLASH_WRITE2: u8 = 0x0B; // flash program write (tried first)
+pub const OP_SFC_FLASH_WRITE2: u8 = 0x0B; // single-byte flash write; tried before 0x05
+pub const OP_SFC_FLASH_PROG_0C: u8 = 0x0C; // bulk flash program; 0x1F2 bytes, same layout as 0x06
+pub const OP_SFC_FLASH_PROG_0D: u8 = 0x0D; // bulk flash program; 0x1E0 bytes, same layout as 0x06
 
 pub(crate) const CRC32: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
@@ -82,12 +89,20 @@ impl SFC {
     }
 
     pub fn write_bus_byte(&mut self, addr: usize, v: u8) -> Result<()> {
-        let mut f = Frame::new(GROUP_SFC, OP_SFC_WRITE_BYTE);
+        self.write_opcode_byte(OP_SFC_WRITE_BYTE, addr, v)
+    }
+
+    pub(crate) fn write_opcode_byte(&mut self, op: u8, addr: usize, v: u8) -> Result<()> {
+        let mut f = Frame::new(GROUP_SFC, op);
         f.set_u24(3, addr as u32);
         f.set(7, v);
         f.finish();
         let bytes: &[u8] = f.as_bytes();
         self.dev.send(&[bytes])
+    }
+
+    pub(crate) fn send_frames(&mut self, frames: &[&[u8]]) -> Result<()> {
+        self.dev.send(frames)
     }
 
     pub fn read_bus(&mut self, addr: usize, n: usize) -> Result<Vec<u8>> {
