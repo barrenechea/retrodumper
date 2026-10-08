@@ -6,7 +6,8 @@
 //! - `T-DRIVER.DMP` — device info block at offset 0x2000; command responses
 //!   are read from offset 0
 //! - `DUMP.ROM` — window onto the cartridge bus; file offset = system bus
-//!   address (for SNES the 24-bit CPU address)
+//!   address. The window check is 24-bit (`0x1000000`), which covers SFC
+//!   and the Sega carts (SMS, Game Gear, Mega Drive).
 //! - `CMD0.CMD`..`CMD3.CMD` — commands; the client cycles `n = (n+1) & 3` and
 //!   creates the file with CREATE_ALWAYS
 //! - `CMD.CMD` — single command file used by legacy-format firmware
@@ -34,10 +35,20 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::protocol;
-use crate::snes::Bus;
 use crate::{Error, Result};
 
 pub use sys::FileHandle;
+
+/// What a cartridge dumper can ask of the device.
+///
+/// `Device` implements this. Tests inject a recording fake. SFC uses it
+/// today; SMS, Game Gear, and Mega Drive will use the same four calls.
+pub trait Bus {
+    fn info(&self) -> &Info;
+    fn send(&mut self, frames: &[&[u8]]) -> Result<()>;
+    fn read_response(&mut self, n: usize) -> Result<Vec<u8>>;
+    fn read_bus(&mut self, addr: usize, n: usize) -> Result<Vec<u8>>;
+}
 
 pub const INFO_FILE_NAME: &str = "T-DRIVER.DMP";
 pub const DUMP_FILE_NAME: &str = "DUMP.ROM";

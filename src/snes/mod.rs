@@ -4,7 +4,7 @@ pub mod mapper;
 pub mod sram;
 pub mod verify;
 
-use crate::device::Info;
+use crate::device::{Bus, Info};
 use crate::protocol::Frame;
 use crate::{Error, Result};
 
@@ -29,15 +29,6 @@ pub(crate) const CRC32: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HD
 /// $E000..$FFFF in DUMP.ROM.
 const HEADER_ADDR: usize = 0xE000;
 const HEADER_LENGTH: usize = 0x2000;
-
-/// The set of device operations the SFC dumper needs. `device::Device`
-/// satisfies it; tests inject a capturing fake.
-pub trait Bus {
-    fn info(&self) -> &Info;
-    fn send(&mut self, frames: &[&[u8]]) -> Result<()>;
-    fn read_response(&mut self, n: usize) -> Result<Vec<u8>>;
-    fn read_bus(&mut self, addr: usize, n: usize) -> Result<Vec<u8>>;
-}
 
 pub struct SFC {
     dev: Box<dyn Bus>,
