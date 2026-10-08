@@ -1,0 +1,32 @@
+[package]
+name = "retrodump"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Cross-platform SNES/SFC dumper for the Retro Base (MSC transport)"
+license = "MIT"
+
+[lib]
+name = "retrodump"
+path = "src/lib.rs"
+
+[[bin]]
+name = "retrodump"
+path = "src/main.rs"
+
+# Small, pinned crates for algorithms and OS contracts we should not
+# reimplement: `crc` (CRC-32/ISO-HDLC and CRC-16/XMODEM) and `getrandom`
+# (the init IV). Unix open flags, fcntl, and mmap come from `libc` so the
+# constants match the host.
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[dependencies]
+crc = "3.4.0"
+getrandom = { version = "0.4.3", features = ["std"] }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.190"
