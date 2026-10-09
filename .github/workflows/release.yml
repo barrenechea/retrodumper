@@ -1,0 +1,136 @@
+# Conventional commits on main choose the next version and the release
+# notes. The release stays a draft until every target has uploaded. A tag
+# created by this workflow does not start a second run, so the upload stays
+# in this file.
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      short: ${{ steps.meta.outputs.short }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: tag
+        uses: mathieudutour/github-tag-action@v7
+        with:
+          github_token: ${{ github.token }}
+          default_bump: false
+          dry_run: true
+      - id: meta
+        env:
+          NEW_TAG: ${{ steps.tag.outputs.new_tag }}
+          NEW_VERSION: ${{ steps.tag.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          tag="${NEW_TAG}"
+          version="${NEW_VERSION}"
+          if [ -z "${tag}" ]; then
+            tag="$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
+            version="${tag#v}"
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "short=${GITHUB_SHA:0:7}" >> "${GITHUB_OUTPUT}"
+      - name: Create draft release
+        if: steps.meta.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          NOTES: ${{ steps.tag.outputs.changelog }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            exit 0
+          fi
+          printf '%s\n' "${NOTES}" > notes.md
+          gh release create "${TAG}" \
+            --target "${GITHUB_SHA}" \
+            --title "${TAG} (${GITHUB_SHA:0:7})" \
+            --notes-file notes.md \
+            --draft
+
+  upload:
+    needs: release
+    if: needs.release.outputs.tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # Last GitHub-hosted Intel macOS image. Retired August 2027.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: retrodump
+          target: ${{ matrix.target }}
+          ref: refs/tags/${{ needs.release.outputs.tag }}
+          archive: retrodump-${{ needs.release.outputs.version }}-${{ needs.release.outputs.short }}-$target
+          checksum: sha256
+          locked: true
+          tar: unix
+          zip: windows
+
+  publish:
+    needs: [release, upload]
+    if: needs.release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: gh release edit "${TAG}" --draft=false
