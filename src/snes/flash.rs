@@ -233,8 +233,7 @@ impl<'a> Flash<'a> {
             let n = (data.len() - off).min(self.frame_len);
             let mut f = Frame::new(super::GROUP_SFC, self.prog_op);
             // Plaintext 0x5A, same as the unlock commands (`0x45dbd0` forces
-            // that magic). The bulk sender `0x45ddc0` stamps 0x5B after SNOW
-            // and writes CMD0–CMD3; this firmware takes one CMD.CMD.
+            // that magic). The bulk sender `0x45ddc0` stamps 0x5B after SNOW.
             f.set_u32(4, addr as u32);
             f.set_u16(8, n as u16);
             f.set_bytes(0x0C, &data[off..off + n]);

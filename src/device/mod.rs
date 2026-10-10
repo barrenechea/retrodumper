@@ -8,10 +8,8 @@
 //! - `DUMP.ROM` — window onto the cartridge bus; file offset = system bus
 //!   address. The window check is 24-bit (`0x1000000`), which covers SFC
 //!   and the Sega carts (SMS, Game Gear, Mega Drive).
-//! - `CMD0.CMD`..`CMD3.CMD` — commands; the client cycles `n = (n+1) & 3` and
-//!   creates the file with CREATE_ALWAYS
-//! - `CMD.CMD` — single command file used by legacy-format firmware
-//!   (SF-Memory 2021, PCB02); CMD0-CMD3 are rejected there
+//! - `CMD0.CMD`..`CMD3.CMD` — commands. Both MSC writers format `%sCMD%d.CMD`
+//!   from byte `0x154584a`, then store `(n+1) & 3` before `CreateFileW`.
 //!
 //! # MSC transport robustness
 //!
@@ -25,8 +23,9 @@
 //!
 //! Unix `open_cmd` therefore creates the file without `O_TRUNC`, which removes
 //! the wedge at its source. Windows uses `CREATE_ALWAYS`, which replaces an
-//! existing file. What remains are transient failures,
-//! retried here with exponential backoff; a failure that outlasts the backoff
+//! existing file. The filename rotation does not replace that. What remains
+//! are transient failures, retried here with exponential backoff; a failure
+//! that outlasts the backoff
 //! is reported as `Error::Unresponsive`.
 
 pub mod sys;
@@ -149,13 +148,9 @@ impl Bus for Device {
             }
             all.extend_from_slice(f);
         }
-        let name = if self.info.legacy {
-            "CMD.CMD".to_string()
-        } else {
-            let n = self.cmd_n;
-            self.cmd_n = (self.cmd_n + 1) & 3;
-            format!("CMD{n}.CMD")
-        };
+        let n = self.cmd_n;
+        self.cmd_n = (self.cmd_n + 1) & 3;
+        let name = format!("CMD{n}.CMD");
         let root = self.root.clone();
         let what = format!("send {name}");
         self.io(&what, move || {
